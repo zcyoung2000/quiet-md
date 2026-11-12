@@ -236,6 +236,59 @@ pub struct Store {
 #[derive(Clone)]
 struct Parsed { title: String, icon: Option<String>, body: std::sync::Arc<str>, reminders: Vec<crate::model::InlineReminder>, links: Vec<crate::model::DocLink> }
 
+/// `Store::parsed` kept between launches (#170): reading every document again
+/// on launch took ~0.45 s a file on Windows, where each read is scanned. The
+/// stamps are this machine's mtimes, so it lives in the cache folder, not in
+/// the (possibly synced) library. Bump `PARSED_CACHE` when what `list` takes
+/// from a file changes; a release discards it anyway.
+const PARSED_CACHE: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct ParsedCache { version: String, docs: HashMap<String, CachedDoc> }
+
+#[derive(Serialize, Deserialize)]
+struct CachedDoc {
+    modified: std::time::SystemTime,
+    len: u64,
+    title: String,
+    icon: Option<String>,
+    body: String,
+    reminders: Vec<(i64, i64, bool, bool)>,
+    links: Vec<(String, usize, Vec<(String, Option<String>)>)>,
+}
+
+fn parsed_cache_version() -> String { format!("{}-{PARSED_CACHE}", env!("CARGO_PKG_VERSION")) }
+
+fn parsed_cache_path(root: &std::path::Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    root.hash(&mut hash);
+    let base = if cfg!(test) { std::env::temp_dir() } else { dirs::cache_dir().unwrap_or_else(std::env::temp_dir) };
+    base.join("quiet-md/list").join(format!("{:016x}.json", hash.finish()))
+}
+
+/// The cache `list` left last time; empty when missing, unreadable or older.
+fn load_parsed(root: &std::path::Path) -> HashMap<String, (std::time::SystemTime, u64, Parsed)> {
+    let Some(c) = std::fs::read(parsed_cache_path(root)).ok().and_then(|b| serde_json::from_slice::<ParsedCache>(&b).ok()) else { return HashMap::new() };
+    if c.version != parsed_cache_version() { return HashMap::new() }
+    c.docs.into_iter().map(|(id, d)| {
+        let reminders = d.reminders.into_iter().map(|(expire, notify, should_notify, whole_day)| crate::model::InlineReminder { expire, notify, should_notify, whole_day }).collect();
+        let links = d.links.into_iter().map(|(target, block, line)| crate::model::DocLink { target, block, line }).collect();
+        (id, (d.modified, d.len, Parsed { title: d.title, icon: d.icon, body: d.body.into(), reminders, links }))
+    }).collect()
+}
+
+fn save_parsed(root: &std::path::Path, parsed: &HashMap<String, (std::time::SystemTime, u64, Parsed)>) -> Result<()> {
+    let docs = parsed.iter().map(|(id, (modified, len, p))| (id.clone(), CachedDoc {
+        modified: *modified, len: *len, title: p.title.clone(), icon: p.icon.clone(), body: p.body.to_string(),
+        reminders: p.reminders.iter().map(|r| (r.expire, r.notify, r.should_notify, r.whole_day)).collect(),
+        links: p.links.iter().map(|l| (l.target.clone(), l.block, l.line.clone())).collect(),
+    })).collect();
+    let path = parsed_cache_path(root);
+    if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
+    write_atomic(&path, &serde_json::to_vec(&ParsedCache { version: parsed_cache_version(), docs })?)
+}
+
 /// One write to the indexes: several copies of the app may share a library
 /// (builds tested side by side), so this is a short mutex, not a
 /// single-instance guard. Released when the write is done.
@@ -396,7 +449,8 @@ impl Store {
         }
         let index = load_json(&root.join("index.json"), "文档索引", &mut warnings);
         let trash = load_json(&root.join("trash").join("index.json"), "回收站索引", &mut warnings);
-        let mut store = Store { file_changes: vec![], root, index, trash, warnings, loaded: Default::default(), copied: Default::default(), parsed: HashMap::new() };
+        let parsed = load_parsed(&root);
+        let mut store = Store { file_changes: vec![], root, index, trash, warnings, loaded: Default::default(), copied: Default::default(), parsed };
         if let Ok(entries) = std::fs::read_dir(store.recovery_dir()) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -523,6 +577,7 @@ impl Store {
         let mut out = vec![];
         let Ok(rd) = std::fs::read_dir(self.root.join("docs")) else { return out };
         let mut dirty = false;
+        let mut reparsed = false;
         let local: Vec<(String, PathBuf)> = self.index.iter().filter_map(|(id, m)| Some((id.clone(), PathBuf::from(m.path.as_ref()?)))).collect();
         let files = rd.flatten().map(|e| e.path()).filter_map(|p| {
             let markdown = match p.extension().and_then(|s| s.to_str()) { Some("xml") => false, Some("md") => true, _ => return None };
@@ -532,7 +587,10 @@ impl Store {
             let md = std::fs::metadata(&p).ok();
             if md.is_none() && self.index.get(&id).is_some_and(Meta::local) { continue; }
             let stamp = md.as_ref().and_then(|m| Some((m.modified().ok()?, m.len())));
-            let parsed = match self.parsed.get(&id).filter(|c| stamp == Some((c.0, c.1))) {
+            // A .md the index doesn't know as Markdown (dropped in by hand, or
+            // an index restored from its backup) is read again to register it.
+            let known = !markdown || self.index.get(&id).is_some_and(|m| m.markdown);
+            let parsed = match self.parsed.get(&id).filter(|c| known && stamp == Some((c.0, c.1))) {
                 Some(c) => c.2.clone(),
                 None => {
                     let Ok(xml) = std::fs::read_to_string(&p) else { continue };
@@ -546,7 +604,7 @@ impl Store {
                     }
                     let doc = self.parse_doc(&id, &xml).unwrap_or_default();
                     let parsed = Parsed { title: doc.title.text.clone(), icon: doc.icon.clone(), body: doc.plain_text().into(), reminders: doc.reminders(), links: doc.doc_links() };
-                    if let Some((t, len)) = stamp { self.parsed.insert(id.clone(), (t, len, parsed.clone())); }
+                    if let Some((t, len)) = stamp { self.parsed.insert(id.clone(), (t, len, parsed.clone())); reparsed = true; }
                     parsed
                 }
             };
@@ -573,7 +631,9 @@ impl Store {
             out.push(Entry { id: id.clone(), meta: meta.clone(), title, icon: None, body: Default::default(), reminders: vec![], links: vec![] });
         }
         let seen: std::collections::HashSet<&str> = out.iter().map(|e| e.id.as_str()).collect();
+        let cached = self.parsed.len();
         self.parsed.retain(|id, _| seen.contains(id.as_str()));
+        if reparsed || self.parsed.len() != cached { let _ = save_parsed(&self.root, &self.parsed); }
         if dirty && _lock.is_some() {
             let _ = self.save_index();
         }
@@ -1065,6 +1125,7 @@ mod tests {
     impl Drop for Lib {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+            let _ = std::fs::remove_file(super::parsed_cache_path(&self.0));
         }
     }
 
@@ -1332,6 +1393,27 @@ mod tests {
         std::fs::remove_file(s.path(&b)).unwrap();
         assert_eq!(titles(&mut s), ["一改"]);
         assert_eq!(s.parsed.len(), 1);
+    }
+
+    #[test]
+    fn list_cache_survives_a_relaunch() {
+        let lib = Lib::new("listcache-disk");
+        let mut s = lib.open();
+        let a = s.create_from(&doc("一")).unwrap();
+        s.create_from(&doc("二")).unwrap();
+        assert_eq!(s.list().len(), 2);
+        drop(s);
+        // A new launch starts with what the last one parsed (#170) …
+        let mut s = lib.open();
+        assert_eq!(s.parsed.len(), 2);
+        s.parsed.get_mut(&a).unwrap().2.title = "缓存".into();
+        assert!(s.list().iter().any(|e| e.title == "缓存"));
+        // … and drops a cache written by another version.
+        let path = parsed_cache_path(&lib.0);
+        let mut c: ParsedCache = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        c.version = "0.0.0-0".into();
+        std::fs::write(&path, serde_json::to_vec(&c).unwrap()).unwrap();
+        assert!(lib.open().parsed.is_empty());
     }
 
     #[test]
