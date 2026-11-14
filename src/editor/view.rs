@@ -2599,8 +2599,11 @@ impl Editor {
             return;
         }
         self.core.insert_text(&s);
-        if s == " " {
+        let block_shortcut = s == " " || matches!(s.as_str(), "。" | "．");
+        if block_shortcut {
             let _ = self.core.markdown_block_shortcut() || self.core.markdown_divider() || self.core.autolink();
+        } else if matches!(s.as_str(), "＃" | "－" | "＊" | "＞" | "｜" | "—") {
+            self.core.markdown_block_shortcut();
         } else if s == "-" {
             self.core.markdown_divider();
         }

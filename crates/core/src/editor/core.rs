@@ -2677,6 +2677,8 @@ impl Core {
     /// character included). `enter` is true when the trigger is Enter.
     fn block_trigger(&self, id: BlockId, prefix: &str, enter: bool) -> Option<BlockKind> {
         let cur = self.kind_of(id)?;
+        let normalized = normalize_markdown_punctuation(prefix);
+        let prefix = normalized.as_str();
         let in_cell = self.is_in_table(id);
         let in_quote = self.parent_kind_is(id, |k| matches!(k, BlockKind::Quote));
         let in_callout = self.parent_kind_is(id, |k| matches!(k, BlockKind::Callout { .. }));
@@ -2687,7 +2689,7 @@ impl Core {
         if enter {
             return prefix.strip_prefix("```").and_then(code);
         }
-        let body = prefix.strip_suffix(' ')?;
+        let body = prefix.strip_suffix([' ', '　'])?;
         match body {
             "-" | "*" | "+" => return Some(BlockKind::Bullet),
             "[]" | "[ ]" | "【】" => return Some(BlockKind::Todo { done: false }),
@@ -2823,18 +2825,18 @@ impl Core {
         let after = &t.text[p.offset..];
         type Setter = fn(&mut Marks);
         // (delimiter, mark, needs whitespace/line boundary on both sides)
-        let rules: [(&str, Setter, bool); 9] = [
-            ("***", |m| { m.bold = true; m.italic = true }, false),
-            ("___", |m| { m.bold = true; m.italic = true }, true),
-            ("**", |m| m.bold = true, false),
-            ("__", |m| m.bold = true, true),
-            ("*", |m| m.italic = true, false),
-            ("_", |m| m.italic = true, true),
-            ("~~", |m| m.strike = true, false),
-            ("~", |m| m.underline = true, true),
-            ("`", |m| m.code = true, false),
+        let rules: [(&str, &str, Setter, bool); 9] = [
+            ("***", "···", |m| { m.bold = true; m.italic = true }, false),
+            ("___", "＿＿＿", |m| { m.bold = true; m.italic = true }, true),
+            ("**", "··", |m| m.bold = true, false),
+            ("__", "＿＿", |m| m.bold = true, true),
+            ("*", "＊", |m| m.italic = true, false),
+            ("_", "＿", |m| m.italic = true, true),
+            ("~~", "～～", |m| m.strike = true, false),
+            ("~", "～", |m| m.underline = true, true),
+            ("`", "·", |m| m.code = true, false),
         ];
-        let boundary = |c: Option<char>| c.is_none_or(char::is_whitespace);
+        let boundary = |c: Option<char>| c.is_none_or(|c| c.is_whitespace() || "，。；：！？、）】》”’".contains(c));
         // `$x$` and `$$x$$` become an inline equation.
         for delim in ["$$", "$"] {
             if !before.ends_with(delim) || t.slice(0..p.offset).runs.last().is_some_and(|r| r.marks.code) {
@@ -2865,28 +2867,53 @@ impl Core {
             self.sel = Selection::caret(Pos::new(p.block, open + EQUATION.len()));
             return true;
         }
-        for (delim, set, bounded) in rules {
-            if !before.ends_with(delim) {
+        for (delim, cjk, set, bounded) in rules {
+            let (open_ch, close_ch) = (delim.chars().next().unwrap(), cjk.chars().next().unwrap());
+            if !before.ends_with(delim) && !before.ends_with(cjk) {
                 continue;
             }
-            let inner_end = before.len() - delim.len();
-            let Some(open) = before[..inner_end].rfind(delim) else { continue };
-            let inner = &before[open + delim.len()..inner_end];
-            let dc = delim.chars().next().unwrap();
-            if inner.is_empty() || inner.starts_with(char::is_whitespace) || inner.starts_with(dc) || inner.ends_with(dc) {
+            let n = delim.chars().count();
+            let close_len = if before.ends_with(delim) { delim.len() } else { cjk.len() };
+            let inner_end = before.len() - close_len;
+            let mut open = None;
+            let mut open_len = 0;
+            for (i, c) in before[..inner_end].char_indices() {
+                if c != open_ch && c != close_ch {
+                    continue;
+                }
+                let run = before[i..inner_end].chars().take_while(|c| c == &open_ch || c == &close_ch).count();
+                if run != n {
+                    continue;
+                }
+                let run_len = before[i..].chars().take(run).map(char::len_utf8).sum::<usize>();
+                if !before[i + run_len..inner_end].contains([open_ch, close_ch]) {
+                    open = Some(i);
+                    open_len = run_len;
+                }
+            }
+            let Some(open) = open else { continue };
+            let inner = &before[open + open_len..inner_end];
+            if inner.is_empty()
+                || inner.starts_with(char::is_whitespace)
+                || inner.starts_with(open_ch)
+                || inner.starts_with(close_ch)
+                || inner.ends_with(open_ch)
+                || inner.ends_with(close_ch)
+            {
                 continue;
             }
             // The delimiter run must be exactly this long on both ends.
-            if before[..open].ends_with(dc) {
+            if before[..open].ends_with(open_ch) || before[..open].ends_with(close_ch) {
                 continue;
             }
-            if bounded && !(boundary(before[..open].chars().next_back()) && boundary(after.chars().next())) {
+            let before_boundary = boundary(before[..open].chars().next_back());
+            if bounded && !(before_boundary && boundary(after.chars().next())) {
                 continue;
             }
-            if dc != '`' && t.slice(open..inner_end).runs.iter().any(|r| r.marks.code) {
+            if open_ch != '`' && t.slice(open..inner_end).runs.iter().any(|r| r.marks.code) {
                 continue;
             }
-            let mut core_inner = t.slice(open + delim.len()..inner_end);
+            let mut core_inner = t.slice(open + open_len..inner_end);
             if core_inner.runs.iter().all(|r| {
                 let mut m = r.marks.clone();
                 set(&mut m);
@@ -3138,6 +3165,10 @@ impl Core {
         }
         out
     }
+}
+
+fn normalize_markdown_punctuation(s: &str) -> String {
+    s.replace('·', "`").replace('＊', "*").replace('＃', "#")
 }
 
 /// A column goes once its last block does, and the
@@ -3636,6 +3667,36 @@ mod tests {
     }
 
     #[test]
+    fn markdown_chinese_shortcuts() {
+        let mut c = doc("<title>T</title><p></p>");
+        let b = id(&c, 1);
+        c.sel = Selection::caret(Pos::new(b, 0));
+        typed(&mut c, "＃＃　");
+        assert!(matches!(c.kind_of(b), Some(BlockKind::Heading { level: 2, .. })));
+
+        c.insert_text("a＊b＊");
+        assert!(c.markdown_inline_shortcut());
+        assert_eq!(xml(&c), "<title>T</title>\n<h2>a<em>b</em></h2>\n");
+
+        c.turn_one(b, BlockKind::Text);
+        c.sel = Selection::caret(Pos::new(b, c.text_of(b).unwrap().text.len()));
+        typed(&mut c, "·code");
+        c.insert_text("·");
+        assert!(c.markdown_inline_shortcut());
+        assert_eq!(xml(&c), "<title>T</title>\n<p>a<em>b</em><code>code</code></p>\n");
+    }
+
+    #[test]
+    fn markdown_chinese_code_fence() {
+        let mut c = doc("<title>T</title><p></p>");
+        let b = id(&c, 1);
+        c.sel = Selection::caret(Pos::new(b, 0));
+        typed(&mut c, "···java");
+        assert!(c.markdown_enter_shortcut());
+        assert!(matches!(c.kind_of(b), Some(BlockKind::Code { lang, .. }) if lang == "Java"), "{}", xml(&c));
+    }
+
+    #[test]
     fn markdown_equations() {
         for (typed_text, src) in [("x $a^2$", Some("a^2")), ("x $$b$$", Some("b")), ("x$a$", None), ("$ $", None)] {
             let mut c = doc("<title>T</title><p></p>");
@@ -3815,7 +3876,7 @@ mod tests {
     fn typed(c: &mut Core, s: &str) {
         for ch in s.chars() {
             c.insert_text(&ch.to_string());
-            if ch == ' ' {
+            if ch == ' ' || ch == '　' {
                 c.markdown_block_shortcut();
             }
             if ch == '-' || ch == ' ' {
